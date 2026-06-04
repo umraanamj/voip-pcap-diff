@@ -41,19 +41,20 @@ Per capture, then a side-by-side diff with a heuristic verdict:
 
 ## Requirements
 
-- [`tshark`](https://www.wireshark.org/) (Wireshark CLI). `capinfos` (ships with Wireshark) is used if present.
+- **Python 3** (standard library only — no pip installs)
+- [`tshark`](https://www.wireshark.org/) (Wireshark CLI) — the dissection engine. `capinfos` (ships with Wireshark) is used if present.
   - macOS: `brew install wireshark`
   - Debian/Ubuntu: `sudo apt install tshark`
 
 ## Usage
 
 ```bash
-./analyze_avaya_pcaps.sh <good_baseline.pcap> <bad_problem.pcap> [output_dir]
+./analyze_avaya_pcaps.py <good_baseline.pcap> <bad_problem.pcap> [-o output_dir]
 ```
 
-- **arg 1** — the capture where audio works (baseline)
-- **arg 2** — the capture with no audio (problem)
-- **output_dir** — optional; defaults to `./avaya_pcap_report/`
+- **good** — the capture where audio works (baseline)
+- **bad** — the capture with no audio (problem)
+- **-o / --output-dir** — optional; defaults to `./avaya_pcap_report/`
 
 Output prints to the terminal **and** is saved to `<output_dir>/report.txt`.
 Both `.pcap` and `.pcapng` are supported.
@@ -70,7 +71,7 @@ The repo ships a fixture generator that builds three synthetic captures
 
 ```bash
 python3 test/make_voip_fixtures.py        # writes /tmp/good.pcap and /tmp/bad.pcap
-./analyze_avaya_pcaps.sh /tmp/good.pcap /tmp/bad.pcap
+./analyze_avaya_pcaps.py /tmp/good.pcap /tmp/bad.pcap
 ```
 
 The `bad.pcap` is flagged as one-way audio; swap in a signaling-only capture to
