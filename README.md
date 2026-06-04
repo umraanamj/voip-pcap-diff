@@ -32,7 +32,8 @@ Per capture, then a side-by-side diff with a heuristic verdict:
 - **Capture summary** — duration, packet/byte counts, protocol hierarchy, top conversations
 - **DNS / FQDNs** — every query + response, resolved A/CNAME, failures (NXDOMAIN/SERVFAIL), unique FQDNs (catches a gateway resolving names to different IPs)
 - **SIP** — full message ladder, REGISTER result, 4xx/5xx/6xx failures, NAT view (`Via` rport/received vs `Contact`)
-- **SDP** — the negotiated media address (`c=`), `m=audio` port, and codecs each side offered
+- **SDP** — per body: the `o=` owner address, session- vs media-level `c=` (media-level wins), `m=audio` port, codecs, and the **direction attribute** (`sendrecv`/`sendonly`/`recvonly`/`inactive`). Two different `c=` addresses (one per party) is **normal**, not a fault; `o=` is a session id, not a media target.
+- **Media reachability** — for each advertised `c=` media address:port, whether RTP actually reached it (appears on the wire? packets to/from?). Surfaces the classic Avaya pattern where `c=` points at a **media gateway / SBCE anchor** that never carries RTP — and explains SDP addresses that legitimately never appear (the `o=`/session-level ones)
 - **RTP / RTCP** — dissected streams, packet loss, jitter, call lifecycle
 - **Media-UDP-on-SDP-ports** — the decisive check: counts media packets **per direction on the exact negotiated ports**, so it also catches **SRTP / encrypted media** that the RTP dissector won't classify
 - **STUN / ICE**, **ICMP errors** (port-unreachable / admin-prohibited = active drop), **H.323** (auto-detected)

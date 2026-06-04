@@ -361,23 +361,155 @@ def sip_analysis(rpt, f, label):
 
 # ---------------------------------------------------------------------------
 # 3. SDP — the negotiated media endpoints (crux of the audio path)
+#
+# Per RFC 4566/3264: each user agent's c= line is WHERE THAT AGENT RECEIVES
+# media. So a normal two-party call legitimately has 2+ distinct c= addresses
+# (one per party) — that is NOT an error. Media-level c= overrides session-level
+# c=. The o= origin address is just a session identifier, NOT a media target.
 # ---------------------------------------------------------------------------
+def is_private(addr):
+    """RFC1918 / loopback / link-local / CGNAT / unspecified — the kind of
+    address a far-side media anchor often can't route audio back to."""
+    if not addr:
+        return False
+    if ":" in addr:
+        return addr == "::"
+    parts = addr.split(".")
+    if len(parts) != 4 or not all(p.isdigit() for p in parts):
+        return False
+    a, b = int(parts[0]), int(parts[1])
+    return (addr == "0.0.0.0" or a in (10, 127)
+            or (a == 169 and b == 254) or (a == 172 and 16 <= b <= 31)
+            or (a == 192 and b == 168) or (a == 100 and 64 <= b <= 127))
+
+
+def sdp_records(f):
+    """One dict per SDP-bearing packet: sender, o= owner address, session/media
+    c= addresses (media-level last = effective), audio port(s), and the
+    negotiated direction attribute (default sendrecv)."""
+    recs = []
+    # NOTE: tshark's `sdp.media_attr` is the WHOLE a= line ("inactive",
+    # "sendrecv", "rtpmap:0 PCMU/8000"). The `sdp.media_attribute.field` field
+    # only holds the name part of name:value attrs (e.g. "rtpmap"), so the
+    # bare direction flags (sendonly/recvonly/inactive) are NOT in it.
+    for r in rows(f, "sdp",
+                  ["frame.time_relative", "ip.src", "ip.dst", "sip.Method",
+                   "sip.Status-Code", "sdp.owner.address",
+                   "sdp.connection_info.address", "sdp.media.port",
+                   "sdp.media_attr"]):
+        r = (r + [""] * 9)[:9]
+        t, src, dst, meth, status, owner, conn, port, attrs = r
+        conns = [c for c in conn.split(",") if c]
+        ports = [p for p in port.split(",") if p]
+        afields = [a.strip() for a in attrs.split(",")]
+        direction = "sendrecv"
+        for d in ("inactive", "sendonly", "recvonly"):
+            if d in afields:
+                direction = d
+                break
+        recs.append(dict(
+            t=t, src=src, dst=dst, meth=meth, status=status, owner=owner,
+            session_c=conns[0] if conns else "",
+            media_c=conns[-1] if conns else "",  # media-level overrides session-level
+            conns=conns, ports=ports, direction=direction))
+    return recs
+
+
+def advertised_media(f):
+    """Distinct (effective media address, port) pairs advertised for audio."""
+    audio_ports = set(str(p) for p in sdp_audio_ports(f))
+    out, seen = [], set()
+    for rec in sdp_records(f):
+        addr = rec["media_c"]
+        for p in rec["ports"]:
+            if audio_ports and p not in audio_ports:
+                continue
+            if addr and (addr, p) not in seen:
+                seen.add((addr, p))
+                out.append((addr, p))
+    return out
+
+
+def endpoint_media(f, addr, port):
+    """(appears_anywhere, udp_pkts_to, udp_pkts_from) for an address:port."""
+    af = "ipv6.addr" if ":" in addr else "ip.addr"
+    sf = "ipv6.src" if ":" in addr else "ip.src"
+    df = "ipv6.dst" if ":" in addr else "ip.dst"
+    appears = count(f, f"{af}=={addr}")
+    to = count(f, f"{df}=={addr} && udp.port=={port}")
+    frm = count(f, f"{sf}=={addr} && udp.port=={port}")
+    return appears, to, frm
+
+
 def sdp_analysis(rpt, f, label):
-    rpt.sub(f"SDP MEDIA NEGOTIATION — {label}  (who told whom to send audio WHERE)")
-    rpt.p("   Each SDP:  src -> dst :: method/status  c=ADDR  m=audio PORT  codecs  attrs")
-    rpt.none_or(fields(f, "sdp",
-                       ["frame.time_relative", "ip.src", "ip.dst", "sip.Method", "sip.Status-Code",
-                        "sdp.connection_info.address", "sdp.media", "sdp.media.port",
-                        "sdp.media.format", "sdp.media_attr.field", "sdp.media_attr.value"], sep="  "))
+    rpt.sub(f"SDP MEDIA NEGOTIATION — {label}  (where each side asked to receive audio)")
+    recs = sdp_records(f)
+    if not recs:
+        rpt.p("   (no SDP bodies seen — media may be negotiated via H.323; see that section)")
+        return
+    rpt.p("   Per SDP body (each side advertises where IT receives audio):")
+    rpt.p("   time         from -> to              kind      o=owner          c=media(eff)     port    dir")
+    for r in recs:
+        kind = (r["meth"] or ("resp" + r["status"])).strip() or "?"
+        frm_to = f"{r['src']} -> {r['dst']}"
+        sess = ""
+        if r["session_c"] and r["session_c"] != r["media_c"]:
+            sess = f"   [session-level c={r['session_c']}]"
+        rpt.p(f"   {r['t']:<12} {frm_to:<22} {kind:<9} {r['owner']:<16} "
+              f"{r['media_c']:<16} {','.join(r['ports']):<6} {r['direction']}{sess}")
     rpt.p("")
-    rpt.p("   >> KEY: the c= address is where the far end will SEND audio.")
-    rpt.p("      If c= is a private/on-prem IP unreachable through Zscaler, audio dies here.")
+    rpt.p("   Codecs offered/answered (m= formats):")
+    codecs = fields(f, "sdp.media.format",
+                    ["sip.Method", "sip.Status-Code", "sdp.media.format"], sep="  ")
+    rpt.none_or(codecs.replace("\\ ", " "))   # tshark escapes spaces in field values
     rpt.p("")
-    rpt.p("   Distinct advertised media (connection) addresses:")
-    rpt.none_or("\n".join(uniq_tokens(f, "sdp", "sdp.connection_info.address")), n=5)
-    rpt.p("")
-    rpt.p("   Distinct audio ports advertised:")
-    rpt.none_or("\n".join(str(p) for p in sdp_audio_ports(f)), n=5)
+    rpt.p("   >> The c=media(eff) address (media-level c= overrides session-level) is where the")
+    rpt.p("      FAR END sends this party's audio. Two different c= addresses (one per party) is")
+    rpt.p("      NORMAL. o=owner is only a session id — NOT a media target, often internal/stale.")
+    rpt.p("      dir: sendrecv=two-way; sendonly/recvonly=one-way; inactive (or c=0.0.0.0)=no media.")
+
+
+# ---------------------------------------------------------------------------
+# 3b. MEDIA REACHABILITY — did RTP actually reach each advertised c= address?
+#     This is what turns "an SDP address I can't find in the pcap" into a
+#     diagnosis: the advertised media target where audio dies.
+# ---------------------------------------------------------------------------
+def media_reachability(rpt, f, label):
+    eps = advertised_media(f)
+    if not eps:
+        return
+    rpt.sub(f"MEDIA REACHABILITY — {label}  (did RTP reach the advertised c= address?)")
+    rpt.p("   advertised media addr:port       appears  udp_to  udp_from   note")
+    for addr, port in eps:
+        appears, to, frm = endpoint_media(f, addr, port)
+        note = ""
+        if addr == "0.0.0.0":
+            note = "c=0.0.0.0 => HOLD/blackhole (no media)"
+        elif appears == 0:
+            note = "NEVER appears on the wire => media BLACK HOLE"
+        elif to == 0 and frm == 0:
+            note = "address seen but ZERO media on this port"
+        elif to == 0 or frm == 0:
+            note = "media ONE-WAY at this endpoint"
+        if is_private(addr) and addr != "0.0.0.0":
+            note = (note + "; " if note else "") + "private/RFC1918 (unroutable from a remote anchor?)"
+        rpt.p(f"   {addr + ':' + port:<30} {appears:>7} {to:>7} {frm:>9}   {note}")
+
+    # Explain SDP addresses that never appear and are NOT media targets — the
+    # "address you can't find in the pcap" (o= origin / session-level c=).
+    media_addrs = {a for a, _ in eps}
+    ghosts = []
+    for r in sdp_records(f):
+        for a in (r["owner"], r["session_c"]):
+            if a and a not in media_addrs and a not in ghosts:
+                if count(f, f"{'ipv6.addr' if ':' in a else 'ip.addr'}=={a}") == 0:
+                    ghosts.append(a)
+    if ghosts:
+        rpt.p("")
+        rpt.p("   These SDP addresses never appear on the wire and are NOT media targets")
+        rpt.p("   (o= origin / session-level c= — identifiers, overridden by media-level c=):")
+        for a in ghosts:
+            rpt.p(f"     {a}   <- expected to be absent; ignore for audio path")
 
 
 # ---------------------------------------------------------------------------
@@ -539,7 +671,6 @@ def facts(f):
     rtp_dirs = len(set(
         tuple(r[:2]) for r in rows(f, "rtp", ["ip.src", "ip.dst"], opts=TS_OPTS)
         if len(r) >= 2 and all(r[:2])))
-    sdp_addrs = uniq_tokens(f, "sdp", "sdp.connection_info.address")
     reg200 = count(f, 'sip.CSeq.method=="REGISTER" && sip.Status-Code==200')
     inv200 = count(f, 'sip.CSeq.method=="INVITE" && sip.Status-Code==200')
     ports = sdp_audio_ports(f)
@@ -551,8 +682,26 @@ def facts(f):
         media_pkts = count(f, filt)
     else:
         media_dirs = media_pkts = None
+
+    # SDP direction attributes + per-endpoint reachability (the corrected logic).
+    directions = sorted(set(r["direction"] for r in sdp_records(f)))
+    eps = advertised_media(f)
+    media_eps = [f"{a}:{p}" for a, p in eps]
+    unreachable = []
+    for addr, port in eps:
+        if addr == "0.0.0.0":
+            unreachable.append((addr, port, "hold"))
+            continue
+        appears, to, frm = endpoint_media(f, addr, port)
+        if appears == 0:
+            unreachable.append((addr, port, "absent"))
+        elif to == 0 and frm == 0:
+            unreachable.append((addr, port, "nomedia"))
+        elif to == 0 or frm == 0:
+            unreachable.append((addr, port, "oneway"))
     return dict(rtp_dirs=rtp_dirs, media_dirs=media_dirs, media_pkts=media_pkts,
-                sdp_addrs=sdp_addrs, reg200=reg200, inv200=inv200)
+                reg200=reg200, inv200=inv200, directions=directions,
+                media_eps=media_eps, unreachable=unreachable)
 
 
 def heuristic_lines(fg, fb):
@@ -575,11 +724,29 @@ def heuristic_lines(fg, fb):
         out.append("       => BAD: media packet count is a fraction of the working call => heavy media")
         out.append("          loss/clipping. Partial path; inspect the directional counts above.")
     out.append("")
-    out.append("   - SDP-advertised media addresses:")
-    out.append(f"       good: {','.join(fg['sdp_addrs']) or 'none'}")
-    out.append(f"       bad : {','.join(fb['sdp_addrs']) or 'none'}")
-    out.append("       => If BAD advertises a different/private/on-prem address than where packets can")
-    out.append("          actually flow under Zscaler, the far end sends audio into a black hole.")
+    # SDP-layer one-way/no-media signals (direction attributes).
+    out.append(f"   - SDP media direction:   good={fg['directions']}   bad={fb['directions']}")
+    bad_dirs = [d for d in fb["directions"] if d in ("inactive", "sendonly", "recvonly")]
+    if bad_dirs:
+        out.append(f"       => BAD negotiated {bad_dirs} at the SDP layer => intentional one-way / no")
+        out.append("          media. A stuck hold/inactive answer alone explains dead audio.")
+    out.append("")
+    # Advertised media endpoints. 2+ distinct c= addresses is NORMAL (one per
+    # party) — we flag reachability, NOT difference.
+    out.append("   - SDP media endpoints (each party advertises its OWN c= — 2+ is NORMAL, not a fault):")
+    out.append(f"       good: {', '.join(fg['media_eps']) or 'none'}")
+    out.append(f"       bad : {', '.join(fb['media_eps']) or 'none'}")
+    if fb["unreachable"]:
+        reason = {"hold": "c=0.0.0.0 hold/blackhole (no media)",
+                  "absent": "that address NEVER appears on the wire (media black hole)",
+                  "nomedia": "address seen but no media on the advertised port",
+                  "oneway": "media flows only one direction at this endpoint"}
+        for addr, port, why in fb["unreachable"]:
+            out.append(f"       => BAD advertised media at {addr}:{port}, but {reason[why]}.")
+        out.append("          That advertised target is where audio dies. In Avaya it's typically a")
+        out.append("          media gateway / SBCE anchor unreachable across the Zscaler tunnel.")
+    else:
+        out.append("       (every advertised media endpoint carries traffic — look at codec/jitter/FW.)")
     return out
 
 
@@ -597,7 +764,8 @@ def comparison(doc, fg, fb):
         doc.p(f"  {lbl} :")
         for k in ("rtp_dirs", "media_dirs", "media_pkts", "reg200", "inv200"):
             doc.p(f"        {k}={d[k]}")
-        doc.p(f"        sdp_addrs={','.join(d['sdp_addrs']) or 'none'}")
+        doc.p(f"        directions={d['directions']}")
+        doc.p(f"        media_eps={', '.join(d['media_eps']) or 'none'}")
 
     show(LGOOD, fg)
     show(LBAD, fb)
@@ -610,8 +778,12 @@ def comparison(doc, fg, fb):
     doc.p("   Classic Zscaler + Avaya audio failure modes:")
     doc.p("     1. Signaling (SIP/TLS or H.323/TCP) rides the tunnel fine -> registers.")
     doc.p("     2. RTP audio is UDP -> blocked, dropped, or NAT-rewritten -> no/one-way audio.")
-    doc.p("     3. SDP c= line carries the client's *local* IP, unreachable from media gateway.")
-    doc.p("     4. Zscaler changes the apparent source IP, so RTP returns to the wrong address.")
+    doc.p("     3. SDP c= points at a media gateway / SBCE anchor unreachable across the tunnel,")
+    doc.p("        or at the client's local IP the anchor can't route back to.")
+    doc.p("     4. Avaya shuffling re-INVITEs media to a direct peer IP that the tunnel can't reach.")
+    doc.p("     5. Zscaler rewrites the source IP, so return RTP arrives from an address the SBC drops.")
+    doc.p("   Reminder: 2+ distinct SDP c= addresses is NORMAL (each party's own receive addr);")
+    doc.p("   the o= owner address is a session id, not a media target.")
 
 
 # ---------------------------------------------------------------------------
@@ -711,10 +883,21 @@ def resolve_pcaps(good_arg, bad_arg):
 
 def one_line_verdict(fg, fb):
     bmp, bmd, gmp = fb["media_pkts"], fb["media_dirs"], fg["media_pkts"]
+    # SDP-layer causes first — they explain dead audio on their own.
+    bad_dirs = [d for d in fb["directions"] if d in ("inactive", "sendonly", "recvonly")]
+    if "inactive" in bad_dirs:
+        return "BAD capture: SDP negotiated a=inactive => no media by design (stuck hold?)."
+    absent = [e for e in fb["unreachable"] if e[2] in ("absent", "hold")]
+    if absent:
+        a, p, _ = absent[0]
+        return (f"BAD capture: media advertised at {a}:{p} but it never carries RTP "
+                f"=> unreachable media anchor.")
     if bmp == 0:
         return "BAD capture: ZERO media on the negotiated ports => audio FULLY BLOCKED."
     if bmd is not None and bmd < 2:
         return "BAD capture: media flows one direction only => ONE-WAY AUDIO."
+    if bad_dirs:
+        return f"BAD capture: SDP direction {bad_dirs} => intentional one-way audio."
     if isinstance(bmp, int) and isinstance(gmp, int) and bmp < gmp // 4 + 1:
         return "BAD capture: media far below the working call => heavy loss/clipping."
     if bmp is None:
@@ -730,6 +913,7 @@ def build_capture_doc(f, label, fg, fb):
     dns_analysis(doc, f, label)
     sip_analysis(doc, f, label)
     sdp_analysis(doc, f, label)
+    media_reachability(doc, f, label)
     h323_analysis(doc, f, label)
     rtp_analysis(doc, f, label)
     media_udp_check(doc, f, label)

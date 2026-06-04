@@ -42,18 +42,19 @@ def sip_200_reg():
     return (b"SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP 10.0.0.10:5060;branch=z9hG4bK1\r\n"
             b"From: <sip:1001@pbx.corp.example>;tag=a\r\nTo: <sip:1001@pbx.corp.example>;tag=b\r\n"
             b"Call-ID: reg1@10.0.0.10\r\nCSeq: 1 REGISTER\r\nContent-Length: 0\r\n\r\n")
-def sdp(addr,port):
+def sdp(addr,port,direction="sendrecv"):
     body=(f"v=0\r\no=- 1 1 IN IP4 {addr}\r\ns=call\r\nc=IN IP4 {addr}\r\nt=0 0\r\n"
-          f"m=audio {port} RTP/AVP 0 8\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\n").encode()
+          f"m=audio {port} RTP/AVP 0 8\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\n"
+          f"a={direction}\r\n").encode()
     return body
-def sip_invite(addr,port):
-    b=sdp(addr,port)
+def sip_invite(addr,port,direction="sendrecv"):
+    b=sdp(addr,port,direction)
     return (b"INVITE sip:1002@pbx.corp.example SIP/2.0\r\nVia: SIP/2.0/UDP 10.0.0.10:5060;branch=z9hG4bK2\r\n"
             b"From: <sip:1001@pbx.corp.example>;tag=c\r\nTo: <sip:1002@pbx.corp.example>\r\n"
             b"Call-ID: call1@10.0.0.10\r\nCSeq: 1 INVITE\r\nContact: <sip:1001@10.0.0.10:5060>\r\n"
             b"Content-Type: application/sdp\r\nContent-Length: "+str(len(b)).encode()+b"\r\n\r\n"+b)
-def sip_200_inv(addr,port):
-    b=sdp(addr,port)
+def sip_200_inv(addr,port,direction="sendrecv"):
+    b=sdp(addr,port,direction)
     return (b"SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP 10.0.0.10:5060;branch=z9hG4bK2\r\n"
             b"From: <sip:1001@pbx.corp.example>;tag=c\r\nTo: <sip:1002@pbx.corp.example>;tag=d\r\n"
             b"Call-ID: call1@10.0.0.10\r\nCSeq: 1 INVITE\r\nContact: <sip:1002@10.0.0.1:5060>\r\n"
@@ -90,4 +91,40 @@ bad=signaling()
 for n in range(20):
     bad.append(frame(PHONE,SRV,PA,SA,rtp(0,n,160*n,0x1111)))    # phone -> server only
 write_pcap('/tmp/bad.pcap',bad)
-print("wrote /tmp/good.pcap and /tmp/bad.pcap")
+
+# ANCHOR: Avaya-style SDP with BOTH a session-level c= (internal origin address
+# that never appears on the wire) AND a media-level c= (the real media anchor,
+# 10.0.0.99). Media-level overrides session-level (RFC 4566 5.7). The phone sends
+# RTP to the anchor; nothing returns => one-way. The internal session-level addr
+# is the "address you can't find in the pcap" — and must NOT be called a problem.
+ANCHOR='10.0.0.99'
+INTERNAL='172.31.255.1'   # session-level c= / o= — never a media endpoint
+def sip_200_dualc(sess_addr,media_addr,port):
+    b=(f"v=0\r\no=- 1 1 IN IP4 {sess_addr}\r\ns=call\r\nc=IN IP4 {sess_addr}\r\nt=0 0\r\n"
+       f"m=audio {port} RTP/AVP 0 8\r\nc=IN IP4 {media_addr}\r\n"
+       f"a=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n").encode()
+    return (b"SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP 10.0.0.10:5060;branch=z9hG4bK2\r\n"
+            b"From: <sip:1001@pbx.corp.example>;tag=c\r\nTo: <sip:1002@pbx.corp.example>;tag=d\r\n"
+            b"Call-ID: call1@10.0.0.10\r\nCSeq: 1 INVITE\r\nContact: <sip:1002@10.0.0.1:5060>\r\n"
+            b"Content-Type: application/sdp\r\nContent-Length: "+str(len(b)).encode()+b"\r\n\r\n"+b)
+anchor=[
+    frame(PHONE,SRV,5060,5060,sip_register()),
+    frame(SRV,PHONE,5060,5060,sip_200_reg()),
+    frame(PHONE,SRV,5060,5060,sip_invite(PHONE,PA)),
+    frame(SRV,PHONE,5060,5060,sip_200_dualc(INTERNAL,ANCHOR,SA)),
+    frame(PHONE,SRV,5060,5060,sip_ack()),
+]
+for n in range(20):
+    anchor.append(frame(PHONE,ANCHOR,PA,SA,rtp(0,n,160*n,0x1111)))  # phone -> anchor, no return
+write_pcap('/tmp/anchor.pcap',anchor)
+
+# HOLD: the 200 OK answer carries a=inactive (SDP-layer no-media), and no RTP flows.
+hold=[
+    frame(PHONE,SRV,5060,5060,sip_register()),
+    frame(SRV,PHONE,5060,5060,sip_200_reg()),
+    frame(PHONE,SRV,5060,5060,sip_invite(PHONE,PA)),
+    frame(SRV,PHONE,5060,5060,sip_200_inv(SRV,SA,direction="inactive")),
+    frame(PHONE,SRV,5060,5060,sip_ack()),
+]
+write_pcap('/tmp/hold.pcap',hold)
+print("wrote /tmp/good.pcap /tmp/bad.pcap /tmp/anchor.pcap /tmp/hold.pcap")
