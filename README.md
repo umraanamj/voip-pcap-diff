@@ -48,6 +48,20 @@ Per capture, then a side-by-side diff with a heuristic verdict:
 
 ## Usage
 
+Run it with **no arguments** — it finds the captures for you:
+
+```bash
+./analyze_avaya_pcaps.py
+```
+
+It looks for exactly two `.pcap`/`.pcapng` files in the current folder, then in
+`~/Downloads`, and guesses which is the working vs. problem capture from the
+filenames (e.g. `onprem`/`baseline`/`good` vs. `zscaler`/`bad`/`noaudio`). If it
+can't find them, it pops a file-picker dialog (macOS) so you can choose the two.
+Then it prints the analysis to the terminal and opens a browser window per pcap.
+
+You can still pass them explicitly to be unambiguous:
+
 ```bash
 ./analyze_avaya_pcaps.py <good_baseline.pcap> <bad_problem.pcap> [-o output_dir] [--no-browser]
 ```

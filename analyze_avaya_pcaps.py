@@ -577,6 +577,98 @@ def comparison(doc, fg, fb):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Pcap discovery — so the script can run with NO command-line arguments.
+# ---------------------------------------------------------------------------
+PCAP_EXTS = (".pcap", ".pcapng", ".cap")
+GOOD_KW = ("onprem", "on-prem", "baseline", "good", "works", "working",
+           "internal", "lan", "direct", "nozscaler", "no-zscaler")
+BAD_KW = ("zscaler", "zia", "zpa", "tunnel", "bad", "broken", "noaudio",
+          "no-audio", "problem", "fail")
+
+
+def list_pcaps(d):
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return []
+    return sorted(os.path.join(d, n) for n in names
+                  if n.lower().endswith(PCAP_EXTS))
+
+
+def classify_pair(paths):
+    """Given exactly two pcap paths, guess which is the working (good) vs the
+    problem (bad) capture from the filenames. Returns (good, bad)."""
+    a, b = paths
+    an, bn = os.path.basename(a).lower(), os.path.basename(b).lower()
+    a_bad = any(k in an for k in BAD_KW)
+    b_bad = any(k in bn for k in BAD_KW)
+    a_good = any(k in an for k in GOOD_KW)
+    b_good = any(k in bn for k in GOOD_KW)
+    if (b_bad or a_good) and not (a_bad or b_good):
+        return a, b
+    if (a_bad or b_good) and not (b_bad or a_good):
+        return b, a
+    return a, b  # can't tell — fall back to alphabetical, caller announces it
+
+
+def macos_pick(prompt):
+    """Pop a native file-chooser dialog (macOS). Returns a path or None."""
+    if sys.platform != "darwin":
+        return None
+    safe = prompt.replace('"', "'")
+    script = f'POSIX path of (choose file with prompt "{safe}")'
+    r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    p = r.stdout.strip()
+    return p or None
+
+
+def resolve_pcaps(good_arg, bad_arg):
+    """Figure out the two captures with no required CLI args:
+       1. explicit args if both given
+       2. exactly two pcaps in the current dir, else in ~/Downloads
+       3. macOS file-picker dialogs as a last resort."""
+    if good_arg and bad_arg:
+        return good_arg, bad_arg
+    if good_arg or bad_arg:
+        sys.exit("ERROR: pass BOTH captures or NEITHER (auto-discovery needs both empty).")
+
+    for d in (os.getcwd(), os.path.expanduser("~/Downloads")):
+        found = list_pcaps(d)
+        if len(found) == 2:
+            good, bad = classify_pair(found)
+            print(f"Auto-discovered 2 captures in {d}:")
+            print(f"   working/baseline -> {os.path.basename(good)}")
+            print(f"   problem/no-audio -> {os.path.basename(bad)}")
+            print("   (override by passing them explicitly: <good> <bad>)\n")
+            return good, bad
+        if len(found) > 2:
+            print(f"Found {len(found)} pcaps in {d}; pick the two to compare.")
+            break
+
+    print("Opening file pickers — choose the two captures...")
+    good = macos_pick("Select the WORKING capture (audio works / on-prem)")
+    bad = macos_pick("Select the BROKEN capture (no audio / zscaler)")
+    if good and bad:
+        return good, bad
+
+    sys.exit("ERROR: no captures selected. Put two .pcap files in this folder or "
+             "~/Downloads, or run: analyze_avaya_pcaps.py <good.pcap> <bad.pcap>")
+
+
+def one_line_verdict(fg, fb):
+    bmp, bmd, gmp = fb["media_pkts"], fb["media_dirs"], fg["media_pkts"]
+    if bmp == 0:
+        return "BAD capture: ZERO media on the negotiated ports => audio FULLY BLOCKED."
+    if bmd is not None and bmd < 2:
+        return "BAD capture: media flows one direction only => ONE-WAY AUDIO."
+    if isinstance(bmp, int) and isinstance(gmp, int) and bmp < gmp // 4 + 1:
+        return "BAD capture: media far below the working call => heavy loss/clipping."
+    if bmp is None:
+        return "No SDP audio ports seen — check signaling; see the report."
+    return "Media present both ways on the ports — look deeper (codec/jitter/firewall)."
+
+
 def build_capture_doc(f, label, fg, fb):
     """Run every per-capture section into a Doc, with the verdict pinned on top."""
     doc = Doc(label)
@@ -598,8 +690,10 @@ def build_capture_doc(f, label, fg, fb):
 def main():
     ap = argparse.ArgumentParser(
         description="Diff two VoIP pcaps to diagnose 'registers but no audio'.")
-    ap.add_argument("good", help="baseline capture where audio works (on-prem)")
-    ap.add_argument("bad", help="problem capture with no audio (zscaler)")
+    ap.add_argument("good", nargs="?", help="baseline capture where audio works "
+                    "(optional; auto-discovered if omitted)")
+    ap.add_argument("bad", nargs="?", help="problem capture with no audio "
+                    "(optional; auto-discovered if omitted)")
     ap.add_argument("-o", "--output-dir", default="./avaya_pcap_report",
                     help="report output directory (default: ./avaya_pcap_report)")
     ap.add_argument("--no-browser", action="store_true",
@@ -608,7 +702,9 @@ def main():
 
     if not TSHARK:
         sys.exit("ERROR: tshark not found. Install with: brew install wireshark")
-    for f in (args.good, args.bad):
+
+    good_pcap, bad_pcap = resolve_pcaps(args.good, args.bad)
+    for f in (good_pcap, bad_pcap):
         if not os.access(f, os.R_OK):
             sys.exit(f"ERROR: cannot read pcap: {f}")
 
@@ -616,9 +712,9 @@ def main():
     txt_path = os.path.join(args.output_dir, "report.txt")
 
     # Compute cross-capture facts once, then build a Doc per capture + comparison.
-    fg, fb = facts(args.good), facts(args.bad)
-    good_doc = build_capture_doc(args.good, LGOOD, fg, fb)
-    bad_doc = build_capture_doc(args.bad, LBAD, fg, fb)
+    fg, fb = facts(good_pcap), facts(bad_pcap)
+    good_doc = build_capture_doc(good_pcap, LGOOD, fg, fb)
+    bad_doc = build_capture_doc(bad_pcap, LBAD, fg, fb)
     cmp_doc = Doc("COMPARISON & VERDICT")
     comparison(cmp_doc, fg, fb)
 
@@ -640,14 +736,20 @@ def main():
     # Plain-text report (terminal + report.txt): both captures then comparison.
     header = (
         "Avaya one-X / VoIP pcap comparison\n"
-        f"  GOOD (baseline, audio works): {args.good}\n"
-        f"  BAD  (problem, no audio)    : {args.bad}\n"
+        f"  GOOD (baseline, audio works): {good_pcap}\n"
+        f"  BAD  (problem, no audio)    : {bad_pcap}\n"
         f"  Report dir: {args.output_dir}\n"
     )
     text = header + "\n".join(render_text(d) for d in (good_doc, bad_doc, cmp_doc))
     print(text)
     with open(txt_path, "w") as fh:
         fh.write(text + "\n")
+
+    # Loud one-line verdict at the end of the terminal output.
+    banner = one_line_verdict(fg, fb)
+    print("\n" + "=" * 72)
+    print("VERDICT: " + banner)
+    print("=" * 72)
 
     abspaths = {fname: os.path.abspath(os.path.join(args.output_dir, fname))
                 for fname, *_ in pages}
@@ -661,4 +763,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BrokenPipeError:
+        pass  # output was piped into a closing reader (e.g. `| head`)
