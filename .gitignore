@@ -1,0 +1,12 @@
+# Never commit real captures — they contain live network data
+*.pcap
+*.pcapng
+*.cap
+
+# Generated reports
+avaya_pcap_report/
+*_report/
+report.txt
+
+# OS cruft
+.DS_Store
