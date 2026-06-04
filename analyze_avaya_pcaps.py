@@ -35,21 +35,35 @@ LGOOD = "ON-PREM (audio WORKS)"
 LBAD = "ZSCALER (NO audio)"
 
 def find_tool(name):
-    """Locate a Wireshark CLI tool on PATH, or in the standard install dirs.
-    Wireshark on Windows installs tshark.exe but does NOT add it to PATH."""
+    """Locate a Wireshark CLI tool. Order: explicit env override -> PATH ->
+    standard install dirs. Wireshark on Windows installs tshark.exe but does
+    NOT add it to PATH, so PATH alone isn't enough."""
+    # 1. Explicit override, e.g.  set TSHARK=C:\path\to\tshark.exe
+    env = os.environ.get(name.upper())
+    if env and os.path.isfile(env):
+        return env
+    # 2. On PATH
     p = shutil.which(name)
     if p:
         return p
+    # 3. Standard install locations
     candidates = []
     if os.name == "nt":
         exe = name + ".exe"
-        bases = {
+        bases = [
             os.environ.get("ProgramFiles", r"C:\Program Files"),
             os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
             os.environ.get("ProgramW6432", r"C:\Program Files"),
-        }
+            r"C:\Program Files\Wireshark",        # literal, in case env vars are odd
+            r"C:\Program Files (x86)\Wireshark",
+        ]
+        seen = set()
         for b in bases:
-            candidates.append(os.path.join(b, "Wireshark", exe))
+            # Allow bases that already end in Wireshark, or that need it appended.
+            for cand in (os.path.join(b, "Wireshark", exe), os.path.join(b, exe)):
+                if cand not in seen:
+                    seen.add(cand)
+                    candidates.append(cand)
     else:
         for b in ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/usr/sbin"):
             candidates.append(os.path.join(b, name))
@@ -743,9 +757,12 @@ def main():
         if os.name == "nt":
             sys.exit(
                 "ERROR: tshark not found.\n"
-                "  Wireshark is installed but tshark.exe isn't on PATH. Either:\n"
-                "   - reinstall Wireshark and tick 'Add Wireshark to the system PATH', or\n"
-                "   - ensure it exists at C:\\Program Files\\Wireshark\\tshark.exe\n"
+                "  Wireshark is installed but tshark.exe wasn't located. Fix any one:\n"
+                "   - point the script straight at it:\n"
+                "       set TSHARK=C:\\Program Files\\Wireshark\\tshark.exe\n"
+                "   - or add it to PATH for this session:\n"
+                "       set PATH=%PATH%;C:\\Program Files\\Wireshark\n"
+                "   - or reinstall Wireshark and tick 'Add Wireshark to the system PATH'\n"
                 "  (Get Wireshark: https://www.wireshark.org/download.html)")
         sys.exit("ERROR: tshark not found. Install with: brew install wireshark "
                  "(macOS) or: sudo apt install tshark (Linux)")
