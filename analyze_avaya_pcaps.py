@@ -19,10 +19,12 @@ Uses tshark (Wireshark CLI) as the dissection engine.
 """
 
 import argparse
+import html
 import os
 import shutil
 import subprocess
 import sys
+import webbrowser
 from collections import Counter
 
 # tshark prefs that matter for VoIP: treat unknown UDP as possible (S)RTP, since
@@ -37,30 +39,29 @@ CAPINFOS = shutil.which("capinfos")
 
 
 # ---------------------------------------------------------------------------
-# Output: tee everything to the report file as well as stdout
+# Output: a Doc accumulates blocks so the same content can be rendered to both
+# plain text (terminal + report.txt) and a per-pcap HTML page.
 # ---------------------------------------------------------------------------
-class Report:
-    def __init__(self, path):
-        self.fh = open(path, "w")
+class Doc:
+    """Collects ('section'|'sub'|'hr'|'line', text) blocks. The analysis
+    functions call .sub()/.p()/.indent()/.none_or()/.hr()/.section() exactly as
+    before; rendering to text or HTML happens afterwards."""
 
-    def p(self, text=""):
-        print(text)
-        self.fh.write(text + "\n")
-
-    def hr(self):
-        self.p("-" * 72)
+    def __init__(self, title=""):
+        self.title = title
+        self.blocks = []
 
     def section(self, title):
-        self.p("")
-        self.p("#" * 72)
-        self.p("## " + title)
-        self.p("#" * 72)
+        self.blocks.append(("section", title))
 
     def sub(self, title):
-        self.p("")
-        self.hr()
-        self.p(">> " + title)
-        self.hr()
+        self.blocks.append(("sub", title))
+
+    def hr(self):
+        self.blocks.append(("hr", ""))
+
+    def p(self, text=""):
+        self.blocks.append(("line", text))
 
     def indent(self, text, n=3):
         pad = " " * n
@@ -68,14 +69,106 @@ class Report:
             self.p(pad + line)
 
     def none_or(self, text, n=3):
-        """Print indented text, or '(none found)' when empty."""
         if text.strip():
             self.indent(text, n)
         else:
             self.p(" " * n + "(none found)")
 
-    def close(self):
-        self.fh.close()
+
+def render_text(doc):
+    """Render a Doc to the same plain-text layout as before."""
+    out = []
+    for kind, val in doc.blocks:
+        if kind == "section":
+            out += ["", "#" * 72, "## " + val, "#" * 72]
+        elif kind == "sub":
+            out += ["", "-" * 72, ">> " + val, "-" * 72]
+        elif kind == "hr":
+            out.append("-" * 72)
+        else:
+            out.append(val)
+    return "\n".join(out)
+
+
+def _html_line(line):
+    """Escape a content line and add light emphasis for headings/verdicts."""
+    esc = html.escape(line)
+    s = line.strip()
+    if s.startswith(">>"):
+        return f'<span class="hd">{esc}</span>'
+    if "=>" in line:
+        return f'<span class="verdict">{esc}</span>'
+    return esc
+
+
+def render_html(doc, nav_links, page_title, subtitle=""):
+    """Render a Doc to a standalone HTML page (cards + <pre> bodies)."""
+    cards = []          # list of (level, heading, [body lines])
+    cur = None
+    for kind, val in doc.blocks:
+        if kind in ("section", "sub"):
+            if cur:
+                cards.append(cur)
+            cur = (kind, val, [])
+        elif kind == "hr":
+            continue    # card borders already provide separation
+        else:
+            if cur is None:
+                cur = ("intro", "", [])
+            cur[2].append(val)
+    if cur:
+        cards.append(cur)
+
+    body = []
+    for level, heading, lines in cards:
+        pre = "\n".join(_html_line(ln) for ln in lines).rstrip("\n")
+        tag = "h1" if level == "section" else "h2"
+        head_html = f"<{tag}>{html.escape(heading)}</{tag}>" if heading else ""
+        body.append(f'<section class="card {level}">{head_html}<pre>{pre}</pre></section>')
+
+    nav_items = []
+    for name, href, here in nav_links:
+        cls = ' class="here"' if here else ""
+        nav_items.append(f'<a href="{href}"{cls}>{html.escape(name)}</a>')
+    nav = " · ".join(nav_items)
+
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{html.escape(page_title)}</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  body {{ margin:0; background:#0f1115; color:#cdd3de;
+         font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }}
+  header {{ position:sticky; top:0; background:#161a22; border-bottom:1px solid #2a3140;
+           padding:12px 20px; }}
+  header h1 {{ margin:0 0 2px; font-size:16px; color:#e6ebf3; }}
+  header .sub {{ color:#8b94a7; font-size:12px; }}
+  nav {{ margin-top:8px; }}
+  nav a {{ color:#7aa2f7; text-decoration:none; margin-right:4px; }}
+  nav a.here {{ color:#e6ebf3; font-weight:700; text-decoration:underline; }}
+  main {{ padding:16px 20px 60px; max-width:1100px; }}
+  .card {{ background:#141821; border:1px solid #232a36; border-radius:8px;
+          margin:14px 0; overflow:hidden; }}
+  .card.section {{ border-color:#3a4256; }}
+  .card h1 {{ margin:0; padding:10px 14px; font-size:14px; background:#1d2330;
+             color:#9ece6a; border-bottom:1px solid #232a36; }}
+  .card h2 {{ margin:0; padding:9px 14px; font-size:13px; background:#191e29;
+             color:#7dcfff; border-bottom:1px solid #232a36; }}
+  pre {{ margin:0; padding:10px 14px; white-space:pre-wrap; word-break:break-word; }}
+  .hd {{ color:#bb9af7; font-weight:700; }}
+  .verdict {{ color:#f7768e; font-weight:700; }}
+</style></head>
+<body>
+<header>
+  <h1>{html.escape(page_title)}</h1>
+  <div class="sub">{html.escape(subtitle)}</div>
+  <nav>{nav}</nav>
+</header>
+<main>
+{chr(10).join(body)}
+</main>
+</body></html>"""
 
 
 # ---------------------------------------------------------------------------
@@ -422,56 +515,86 @@ def facts(f):
                 sdp_addrs=sdp_addrs, reg200=reg200, inv200=inv200)
 
 
-def comparison(rpt, good, bad):
-    rpt.section("SIDE-BY-SIDE COMPARISON & LIKELY CAUSE")
-    fg, fb = facts(good), facts(bad)
+def heuristic_lines(fg, fb):
+    """The cross-capture verdict, as a list of text lines. Used both in the
+    comparison page and pinned at the top of each per-pcap page."""
+    out = []
+    out.append(f"   - RTP flow directions (dissected):   good={fg['rtp_dirs']}   bad={fb['rtp_dirs']}")
+    out.append(f"   - MEDIA on SDP ports (SRTP-aware):    "
+               f"good: dirs={fg['media_dirs']} pkts={fg['media_pkts']}   "
+               f"bad: dirs={fb['media_dirs']} pkts={fb['media_pkts']}")
+    out.append("     ^ Decisive signal — it counts encrypted media the RTP dissector misses.")
+    bmp, bmd, gmp = fb["media_pkts"], fb["media_dirs"], fg["media_pkts"]
+    if bmp == 0:
+        out.append("       => BAD: ZERO media packets on the negotiated audio ports. Audio is fully")
+        out.append("          blocked outbound/inbound (Zscaler/firewall dropping UDP media). No audio.")
+    elif bmd is not None and bmd < 2:
+        out.append("       => BAD: media flows in only ONE direction on the audio ports => ONE-WAY AUDIO.")
+        out.append("          The reverse path is dropped (return RTP to a non-routable/NAT'd address).")
+    elif isinstance(bmp, int) and isinstance(gmp, int) and bmp < gmp // 4 + 1:
+        out.append("       => BAD: media packet count is a fraction of the working call => heavy media")
+        out.append("          loss/clipping. Partial path; inspect the directional counts above.")
+    out.append("")
+    out.append("   - SDP-advertised media addresses:")
+    out.append(f"       good: {','.join(fg['sdp_addrs']) or 'none'}")
+    out.append(f"       bad : {','.join(fb['sdp_addrs']) or 'none'}")
+    out.append("       => If BAD advertises a different/private/on-prem address than where packets can")
+    out.append("          actually flow under Zscaler, the far end sends audio into a black hole.")
+    return out
+
+
+def verdict_box(doc, fg, fb):
+    """Pin the cross-capture verdict at the top of a per-pcap page."""
+    doc.section("VERDICT — cross-capture summary")
+    for line in heuristic_lines(fg, fb):
+        doc.p(line)
+
+
+def comparison(doc, fg, fb):
+    doc.section("SIDE-BY-SIDE COMPARISON & LIKELY CAUSE")
 
     def show(lbl, d):
-        rpt.p(f"  {lbl} :")
+        doc.p(f"  {lbl} :")
         for k in ("rtp_dirs", "media_dirs", "media_pkts", "reg200", "inv200"):
-            rpt.p(f"        {k}={d[k]}")
-        rpt.p(f"        sdp_addrs={','.join(d['sdp_addrs']) or 'none'}")
+            doc.p(f"        {k}={d[k]}")
+        doc.p(f"        sdp_addrs={','.join(d['sdp_addrs']) or 'none'}")
 
     show(LGOOD, fg)
     show(LBAD, fb)
-    rpt.p("")
-    rpt.hr()
-    rpt.p("  HEURISTIC READING:")
-    rpt.p(f"   - RTP flow directions (dissected):   good={fg['rtp_dirs']}   bad={fb['rtp_dirs']}")
-    rpt.p(f"   - MEDIA on SDP ports (SRTP-aware):    "
-          f"good: dirs={fg['media_dirs']} pkts={fg['media_pkts']}   "
-          f"bad: dirs={fb['media_dirs']} pkts={fb['media_pkts']}")
-    rpt.p("     ^ This is the decisive signal — it counts encrypted media the RTP dissector misses.")
-
-    bmp, bmd, gmp = fb["media_pkts"], fb["media_dirs"], fg["media_pkts"]
-    if bmp == 0:
-        rpt.p("       => BAD: ZERO media packets on the negotiated audio ports. Audio is fully")
-        rpt.p("          blocked outbound/inbound (Zscaler/firewall dropping UDP media). No audio.")
-    elif bmd is not None and bmd < 2:
-        rpt.p("       => BAD: media flows in only ONE direction on the audio ports => ONE-WAY AUDIO.")
-        rpt.p("          The reverse path is dropped (return RTP to a non-routable/NAT'd address).")
-    elif (isinstance(bmp, int) and isinstance(gmp, int)
-          and bmp < gmp // 4 + 1):
-        rpt.p("       => BAD: media packet count is a fraction of the working call => heavy media")
-        rpt.p("          loss/clipping. Partial path; inspect the directional counts above.")
-
-    rpt.p("")
-    rpt.p("   - SDP-advertised media addresses:")
-    rpt.p(f"       good: {','.join(fg['sdp_addrs']) or 'none'}")
-    rpt.p(f"       bad : {','.join(fb['sdp_addrs']) or 'none'}")
-    rpt.p("       => If BAD advertises a different/private/on-prem address than where packets can")
-    rpt.p("          actually flow under Zscaler, the far end sends audio into a black hole.")
-    rpt.p("")
-    rpt.p("   Classic Zscaler + Avaya audio failure modes:")
-    rpt.p("     1. Signaling (SIP/TLS or H.323/TCP) rides the tunnel fine -> registers.")
-    rpt.p("     2. RTP audio is UDP -> blocked, dropped, or NAT-rewritten -> no/one-way audio.")
-    rpt.p("     3. SDP c= line carries the client's *local* IP, unreachable from media gateway.")
-    rpt.p("     4. Zscaler changes the apparent source IP, so RTP returns to the wrong address.")
+    doc.p("")
+    doc.hr()
+    doc.p("  HEURISTIC READING:")
+    for line in heuristic_lines(fg, fb):
+        doc.p(line)
+    doc.p("")
+    doc.p("   Classic Zscaler + Avaya audio failure modes:")
+    doc.p("     1. Signaling (SIP/TLS or H.323/TCP) rides the tunnel fine -> registers.")
+    doc.p("     2. RTP audio is UDP -> blocked, dropped, or NAT-rewritten -> no/one-way audio.")
+    doc.p("     3. SDP c= line carries the client's *local* IP, unreachable from media gateway.")
+    doc.p("     4. Zscaler changes the apparent source IP, so RTP returns to the wrong address.")
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def build_capture_doc(f, label, fg, fb):
+    """Run every per-capture section into a Doc, with the verdict pinned on top."""
+    doc = Doc(label)
+    verdict_box(doc, fg, fb)
+    capture_summary(doc, f, label)
+    dns_analysis(doc, f, label)
+    sip_analysis(doc, f, label)
+    sdp_analysis(doc, f, label)
+    h323_analysis(doc, f, label)
+    rtp_analysis(doc, f, label)
+    media_udp_check(doc, f, label)
+    stun_check(doc, f, label)
+    icmp_check(doc, f, label)
+    transport_health(doc, f, label)
+    expert_info(doc, f, label)
+    return doc
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Diff two VoIP pcaps to diagnose 'registers but no audio'.")
@@ -479,6 +602,8 @@ def main():
     ap.add_argument("bad", help="problem capture with no audio (zscaler)")
     ap.add_argument("-o", "--output-dir", default="./avaya_pcap_report",
                     help="report output directory (default: ./avaya_pcap_report)")
+    ap.add_argument("--no-browser", action="store_true",
+                    help="don't open the HTML pages in a browser")
     args = ap.parse_args()
 
     if not TSHARK:
@@ -488,32 +613,51 @@ def main():
             sys.exit(f"ERROR: cannot read pcap: {f}")
 
     os.makedirs(args.output_dir, exist_ok=True)
-    rpt = Report(os.path.join(args.output_dir, "report.txt"))
+    txt_path = os.path.join(args.output_dir, "report.txt")
 
-    rpt.p("Avaya one-X / VoIP pcap comparison")
-    rpt.p(f"  GOOD (baseline, audio works): {args.good}")
-    rpt.p(f"  BAD  (problem, no audio)    : {args.bad}")
-    rpt.p(f"  Report: {os.path.join(args.output_dir, 'report.txt')}")
-    rpt.p(f"  tshark: {run([TSHARK, '-v']).splitlines()[0] if run([TSHARK, '-v']) else '?'}")
+    # Compute cross-capture facts once, then build a Doc per capture + comparison.
+    fg, fb = facts(args.good), facts(args.bad)
+    good_doc = build_capture_doc(args.good, LGOOD, fg, fb)
+    bad_doc = build_capture_doc(args.bad, LBAD, fg, fb)
+    cmp_doc = Doc("COMPARISON & VERDICT")
+    comparison(cmp_doc, fg, fb)
 
-    for f, label in ((args.good, LGOOD), (args.bad, LBAD)):
-        rpt.section(f"CAPTURE: {label}")
-        capture_summary(rpt, f, label)
-        dns_analysis(rpt, f, label)
-        sip_analysis(rpt, f, label)
-        sdp_analysis(rpt, f, label)
-        h323_analysis(rpt, f, label)
-        rtp_analysis(rpt, f, label)
-        media_udp_check(rpt, f, label)
-        stun_check(rpt, f, label)
-        icmp_check(rpt, f, label)
-        transport_health(rpt, f, label)
-        expert_info(rpt, f, label)
+    # Per-pcap HTML pages (+ a comparison page), cross-linked via a nav bar.
+    pages = [
+        ("good.html", good_doc, LGOOD, args.good),
+        ("bad.html", bad_doc, LBAD, args.bad),
+        ("comparison.html", cmp_doc, "Comparison & Verdict", "both captures"),
+    ]
+    nav_meta = [("On-prem (works)", "good.html"),
+                ("Zscaler (no audio)", "bad.html"),
+                ("Comparison", "comparison.html")]
+    for fname, doc, title, src in pages:
+        nav = [(name, href, href == fname) for name, href in nav_meta]
+        out = render_html(doc, nav, title, subtitle=f"source: {src}")
+        with open(os.path.join(args.output_dir, fname), "w") as fh:
+            fh.write(out)
 
-    comparison(rpt, args.good, args.bad)
-    rpt.p("")
-    rpt.p(f"Done. Full report saved to: {os.path.join(args.output_dir, 'report.txt')}")
-    rpt.close()
+    # Plain-text report (terminal + report.txt): both captures then comparison.
+    header = (
+        "Avaya one-X / VoIP pcap comparison\n"
+        f"  GOOD (baseline, audio works): {args.good}\n"
+        f"  BAD  (problem, no audio)    : {args.bad}\n"
+        f"  Report dir: {args.output_dir}\n"
+    )
+    text = header + "\n".join(render_text(d) for d in (good_doc, bad_doc, cmp_doc))
+    print(text)
+    with open(txt_path, "w") as fh:
+        fh.write(text + "\n")
+
+    abspaths = {fname: os.path.abspath(os.path.join(args.output_dir, fname))
+                for fname, *_ in pages}
+    print(f"\nReports written to: {os.path.abspath(args.output_dir)}/")
+    print("  HTML: good.html, bad.html, comparison.html   Text: report.txt")
+
+    # Open one browser window per pcap (the request). Comparison stays linked.
+    if not args.no_browser:
+        for fname in ("good.html", "bad.html"):
+            webbrowser.open("file://" + abspaths[fname])
 
 
 if __name__ == "__main__":

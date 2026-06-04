@@ -49,15 +49,26 @@ Per capture, then a side-by-side diff with a heuristic verdict:
 ## Usage
 
 ```bash
-./analyze_avaya_pcaps.py <good_baseline.pcap> <bad_problem.pcap> [-o output_dir]
+./analyze_avaya_pcaps.py <good_baseline.pcap> <bad_problem.pcap> [-o output_dir] [--no-browser]
 ```
 
 - **good** — the capture where audio works (baseline)
 - **bad** — the capture with no audio (problem)
 - **-o / --output-dir** — optional; defaults to `./avaya_pcap_report/`
+- **--no-browser** — don't open the HTML pages (useful for headless/CI runs)
 
-Output prints to the terminal **and** is saved to `<output_dir>/report.txt`.
-Both `.pcap` and `.pcapng` are supported.
+### Output
+
+By default it **opens a browser window for each pcap**, plus writes everything to `<output_dir>/`:
+
+| File | Contents |
+|------|----------|
+| `good.html` | full analysis of the baseline capture, with the verdict pinned on top |
+| `bad.html` | full analysis of the problem capture, with the verdict pinned on top |
+| `comparison.html` | side-by-side comparison + heuristic verdict (linked from each page) |
+| `report.txt` | the same content as plain text (also printed to the terminal) |
+
+The three HTML pages are cross-linked by a nav bar. Both `.pcap` and `.pcapng` are supported.
 
 ### Capture tips
 
