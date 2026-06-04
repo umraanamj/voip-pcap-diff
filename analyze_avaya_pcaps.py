@@ -34,8 +34,34 @@ TS_OPTS = ["-o", "rtp.heuristic_rtp:TRUE", "-o", "rtcp.heuristic_rtcp:TRUE"]
 LGOOD = "ON-PREM (audio WORKS)"
 LBAD = "ZSCALER (NO audio)"
 
-TSHARK = shutil.which("tshark")
-CAPINFOS = shutil.which("capinfos")
+def find_tool(name):
+    """Locate a Wireshark CLI tool on PATH, or in the standard install dirs.
+    Wireshark on Windows installs tshark.exe but does NOT add it to PATH."""
+    p = shutil.which(name)
+    if p:
+        return p
+    candidates = []
+    if os.name == "nt":
+        exe = name + ".exe"
+        bases = {
+            os.environ.get("ProgramFiles", r"C:\Program Files"),
+            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+            os.environ.get("ProgramW6432", r"C:\Program Files"),
+        }
+        for b in bases:
+            candidates.append(os.path.join(b, "Wireshark", exe))
+    else:
+        for b in ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/usr/sbin"):
+            candidates.append(os.path.join(b, name))
+        candidates.append(f"/Applications/Wireshark.app/Contents/MacOS/{name}")
+    for c in candidates:
+        if c and os.path.isfile(c):
+            return c
+    return None
+
+
+TSHARK = find_tool("tshark")
+CAPINFOS = find_tool("capinfos")
 
 
 # ---------------------------------------------------------------------------
@@ -612,15 +638,28 @@ def classify_pair(paths):
     return a, b  # can't tell — fall back to alphabetical, caller announces it
 
 
-def macos_pick(prompt):
-    """Pop a native file-chooser dialog (macOS). Returns a path or None."""
-    if sys.platform != "darwin":
-        return None
-    safe = prompt.replace('"', "'")
-    script = f'POSIX path of (choose file with prompt "{safe}")'
-    r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-    p = r.stdout.strip()
-    return p or None
+def pick_file(prompt):
+    """Pop a native file-chooser dialog. tkinter works on Windows/macOS/Linux;
+    fall back to AppleScript on macOS. Returns a path or None."""
+    try:
+        import tkinter
+        from tkinter import filedialog
+        root = tkinter.Tk()
+        root.withdraw()
+        path = filedialog.askopenfilename(
+            title=prompt,
+            filetypes=[("Captures", "*.pcap *.pcapng *.cap"), ("All files", "*.*")])
+        root.destroy()
+        if path:
+            return path
+    except Exception:
+        pass
+    if sys.platform == "darwin":
+        safe = prompt.replace('"', "'")
+        script = f'POSIX path of (choose file with prompt "{safe}")'
+        r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+        return r.stdout.strip() or None
+    return None
 
 
 def resolve_pcaps(good_arg, bad_arg):
@@ -647,8 +686,8 @@ def resolve_pcaps(good_arg, bad_arg):
             break
 
     print("Opening file pickers — choose the two captures...")
-    good = macos_pick("Select the WORKING capture (audio works / on-prem)")
-    bad = macos_pick("Select the BROKEN capture (no audio / zscaler)")
+    good = pick_file("Select the WORKING capture (audio works / on-prem)")
+    bad = pick_file("Select the BROKEN capture (no audio / zscaler)")
     if good and bad:
         return good, bad
 
@@ -701,7 +740,15 @@ def main():
     args = ap.parse_args()
 
     if not TSHARK:
-        sys.exit("ERROR: tshark not found. Install with: brew install wireshark")
+        if os.name == "nt":
+            sys.exit(
+                "ERROR: tshark not found.\n"
+                "  Wireshark is installed but tshark.exe isn't on PATH. Either:\n"
+                "   - reinstall Wireshark and tick 'Add Wireshark to the system PATH', or\n"
+                "   - ensure it exists at C:\\Program Files\\Wireshark\\tshark.exe\n"
+                "  (Get Wireshark: https://www.wireshark.org/download.html)")
+        sys.exit("ERROR: tshark not found. Install with: brew install wireshark "
+                 "(macOS) or: sudo apt install tshark (Linux)")
 
     good_pcap, bad_pcap = resolve_pcaps(args.good, args.bad)
     for f in (good_pcap, bad_pcap):
